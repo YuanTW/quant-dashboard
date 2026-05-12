@@ -1,20 +1,13 @@
 """
-database.py — 資料庫操作模組
-支援 SQLite（本地開發）與 PostgreSQL（Railway 雲端）
-策略每次執行結果都會寫入，保留歷史紀錄
+database.py — 資料庫操作模組（懶初始化版本）
+engine 在第一次呼叫時才建立，避免 import 時就崩潰
 """
-import json
 import os
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import (
-    Column, DateTime, Integer, String, Text,
-    create_engine, text
-)
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-
-import config
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
 # ── ORM 基礎類別 ─────────────────────────────────────────────────────────────
@@ -22,86 +15,91 @@ class Base(DeclarativeBase):
     pass
 
 
-# ── 策略結果表 ────────────────────────────────────────────────────────────────
 class StrategyResult(Base):
     __tablename__ = "strategy_results"
 
     id             = Column(Integer, primary_key=True, autoincrement=True)
-    strategy_id    = Column(String(100), nullable=False, index=True)   # 策略唯一識別碼
-    strategy_name  = Column(String(200), nullable=False)               # 顯示名稱
-    recommendation = Column(Text,        nullable=True)                # 推薦方向文字
-    signal         = Column(String(20),  nullable=True)                # BUY / SELL / HOLD
-    details        = Column(Text,        nullable=True)                # 詳細說明（選填）
-    chart_path     = Column(String(500), nullable=True)                # 損益圖路徑
+    strategy_id    = Column(String(100), nullable=False, index=True)
+    strategy_name  = Column(String(200), nullable=False)
+    recommendation = Column(Text,        nullable=True)
+    signal         = Column(String(20),  nullable=True)
+    details        = Column(Text,        nullable=True)
+    chart_path     = Column(String(500), nullable=True)
     status         = Column(String(20),  nullable=False, default="pending")
-    #   pending / running / success / error
     error_message  = Column(Text,        nullable=True)
     updated_at     = Column(DateTime,    nullable=True)
     created_at     = Column(DateTime,    default=datetime.utcnow)
 
 
-# ── 引擎 & Session ───────────────────────────────────────────────────────────
-def _make_engine():
-    url = config.DATABASE_URL
-    # Railway 的 PostgreSQL URL 有時以 postgres:// 開頭，SQLAlchemy 需要 postgresql://
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    kwargs = {}
-    if url.startswith("postgresql"):
-        kwargs["pool_pre_ping"] = True
-    return create_engine(url, **kwargs)
+# ── 懶初始化：第一次呼叫才建立 engine ─────────────────────────────────────────
+_engine = None
+_SessionLocal = None
 
 
-_engine = _make_engine()
-SessionLocal = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
+def _get_engine():
+    global _engine, _SessionLocal
+    if _engine is None:
+        url = os.getenv("DATABASE_URL", "sqlite:///quant_dashboard.db")
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        kwargs = {"pool_pre_ping": True} if url.startswith("postgresql") else {}
+        _engine = create_engine(url, **kwargs)
+        _SessionLocal = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
+    return _engine
+
+
+def _get_session():
+    _get_engine()
+    return _SessionLocal()
 
 
 def init_db():
-    """建立所有資料表（若不存在）"""
-    Base.metadata.create_all(_engine)
+    engine = _get_engine()
+    Base.metadata.create_all(engine)
 
 
 # ── CRUD ─────────────────────────────────────────────────────────────────────
 def get_latest_result(strategy_id: str) -> Optional[StrategyResult]:
-    """取得指定策略的最新一筆結果"""
-    with SessionLocal() as db:
-        return (
-            db.query(StrategyResult)
-            .filter(StrategyResult.strategy_id == strategy_id)
-            .order_by(StrategyResult.updated_at.desc())
-            .first()
-        )
+    try:
+        with _get_session() as db:
+            return (
+                db.query(StrategyResult)
+                .filter(StrategyResult.strategy_id == strategy_id)
+                .order_by(StrategyResult.updated_at.desc())
+                .first()
+            )
+    except Exception:
+        return None
 
 
-def get_all_latest_results() -> list[StrategyResult]:
-    """取得每個策略 ID 最新一筆結果（用於儀表板主頁）"""
-    with SessionLocal() as db:
-        # 子查詢找出每個 strategy_id 最大 updated_at
-        subq = (
-            db.query(
-                StrategyResult.strategy_id,
-                StrategyResult.updated_at.label("max_updated"),
+def get_all_latest_results():
+    try:
+        with _get_session() as db:
+            subq = (
+                db.query(
+                    StrategyResult.strategy_id,
+                    StrategyResult.updated_at.label("max_updated"),
+                )
+                .group_by(StrategyResult.strategy_id)
+                .subquery()
             )
-            .group_by(StrategyResult.strategy_id)
-            .subquery()
-        )
-        rows = (
-            db.query(StrategyResult)
-            .join(
-                subq,
-                (StrategyResult.strategy_id == subq.c.strategy_id)
-                & (StrategyResult.updated_at == subq.c.max_updated),
+            rows = (
+                db.query(StrategyResult)
+                .join(
+                    subq,
+                    (StrategyResult.strategy_id == subq.c.strategy_id)
+                    & (StrategyResult.updated_at == subq.c.max_updated),
+                )
+                .all()
             )
-            .all()
-        )
-        # detach from session so caller can use outside context
-        db.expunge_all()
-        return rows
+            db.expunge_all()
+            return rows
+    except Exception:
+        return []
 
 
 def upsert_running(strategy_id: str, strategy_name: str) -> int:
-    """把策略狀態設為 running，回傳新 row 的 id"""
-    with SessionLocal() as db:
+    with _get_session() as db:
         row = StrategyResult(
             strategy_id   = strategy_id,
             strategy_name = strategy_name,
@@ -114,15 +112,9 @@ def upsert_running(strategy_id: str, strategy_name: str) -> int:
         return row.id
 
 
-def save_result(
-    row_id: int,
-    recommendation: str,
-    signal: str,
-    chart_path: Optional[str],
-    details: Optional[str] = None,
-):
-    """儲存策略執行成功結果"""
-    with SessionLocal() as db:
+def save_result(row_id: int, recommendation: str, signal: str,
+                chart_path: Optional[str], details: Optional[str] = None):
+    with _get_session() as db:
         row = db.get(StrategyResult, row_id)
         if row:
             row.recommendation = recommendation
@@ -135,8 +127,7 @@ def save_result(
 
 
 def save_error(row_id: int, error_message: str):
-    """儲存策略執行失敗資訊"""
-    with SessionLocal() as db:
+    with _get_session() as db:
         row = db.get(StrategyResult, row_id)
         if row:
             row.status        = "error"
@@ -146,7 +137,7 @@ def save_error(row_id: int, error_message: str):
 
 
 def get_result_by_id(row_id: int) -> Optional[StrategyResult]:
-    with SessionLocal() as db:
+    with _get_session() as db:
         row = db.get(StrategyResult, row_id)
         if row:
             db.expunge(row)
