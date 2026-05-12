@@ -1,0 +1,20 @@
+{
+  "strategies": [
+    {
+      "id": "strategy_01",
+      "name": "策略一：範例 MA 交叉",
+      "script": "strategies/strategy_template.py",
+      "schedule": "0 8 * * 1-5",
+      "enabled": true,
+      "description": "台積電 5/20 日均線交叉策略，每個交易日早上 8:00 自動執行"
+    },
+    {
+      "id": "strategy_02",
+      "name": "策略二：（你的第二個策略）",
+      "script": "strategies/your_strategy_2.py",
+      "schedule": "30 8 * * 1-5",
+      "enabled": false,
+      "description": "請把 enabled 改為 true 並填入你的腳本路徑"
+    }
+  ]
+}
