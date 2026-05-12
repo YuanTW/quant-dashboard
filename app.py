@@ -283,4 +283,3 @@ TELEGRAM_CHAT_ID = "你的 Chat ID"
 if any(st.session_state.get(f"running_{s['id']}", False) for s in strategies):
     time.sleep(5)
     st.rerun()
-
